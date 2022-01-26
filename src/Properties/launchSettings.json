@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DatadogAssemblyPatcher": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\aot\\input\\SimpleApp.dll C:\\aot\\output C:\\git\\dd-trace-dotnet\\tracer\\bin\\tracer-home"
+    }
+  }
+}

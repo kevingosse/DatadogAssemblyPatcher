@@ -1,43 +1,67 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
-using Mono.Cecil.Rocks;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace DatadogAssemblyPatcher
 {
     class Program
     {
-        private static Integrations[] _integrations;
+        private static NativeCallTargetDefinition[] _integrations;
 
         static void Main(string[] args)
         {
             if (args.Length != 3)
             {
-                Console.WriteLine("Usage: {inputFolder} {outputFolder} {Tracer home folder}");
+                Console.WriteLine("Usage: {entryPoint} {outputFolder} {Tracer home folder}");
                 return;
             }
 
-            var inputFolder = args[0];
+            var entryAssembly = args[0];
+            var inputFolder = Path.GetDirectoryName(entryAssembly);
             var outputFolder = args[1];
             var tracerHomeFolder = args[2];
 
-            var integrationsAssembly = AssemblyDefinition.ReadAssembly(Path.Combine(tracerHomeFolder, "netstandard2.0", "Datadog.Trace.ClrProfiler.Managed.dll"));
+            var tracerPath = Path.Combine(tracerHomeFolder, "netcoreapp3.1", "Datadog.Trace.dll");
 
-            var rawJson = File.ReadAllText(Path.Combine(tracerHomeFolder, "integrations.json"));
+            _integrations = ReadIntegrations(tracerPath);
 
-            _integrations = JsonConvert.DeserializeObject<Integrations[]>(rawJson);
+            var resolver = new DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(inputFolder);
+            resolver.AddSearchDirectory(Path.Combine(tracerHomeFolder, "netcoreapp3.1"));
 
-            foreach (var file in Directory.GetFiles(inputFolder, "*.dll"))
+            var tracerAssembly = AssemblyDefinition.ReadAssembly(tracerPath);
+
+            var consoleAssembly = AssemblyDefinition.ReadAssembly(Path.Combine(inputFolder, "System.Console.dll"));
+
+            var writeLineMethod = consoleAssembly.MainModule.Types
+                .First(t => t.FullName == "System.Console")
+                .Methods.First(m => m.Name == "WriteLine" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "String");
+
+            var callTargetInvokerType = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.CallTarget.CallTargetInvoker");
+
+            var callTargetStateType = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.CallTarget.CallTargetState");
+
+            var callTargetReturnType = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.CallTarget.CallTargetReturn`1");
+            //var callTargetReturnMethod = callTargetReturnType.Methods.First(t => t.Name == "GetReturnValue");
+
+            var depsJson = Path.GetFileNameWithoutExtension(entryAssembly) + ".deps.json";
+
+            foreach (var file in Directory.GetFiles(inputFolder, "*"))
             {
+                File.Copy(file, Path.Combine(outputFolder, Path.GetFileName(file)), overwrite: true);
+
                 AssemblyDefinition assembly;
 
                 try
                 {
-                    assembly = AssemblyDefinition.ReadAssembly(file);
+                    assembly = AssemblyDefinition.ReadAssembly(file, new ReaderParameters { AssemblyResolver = resolver });
                 }
                 catch (Exception)
                 {
@@ -51,6 +75,16 @@ namespace DatadogAssemblyPatcher
 
                 bool isAssemblyModified = false;
 
+                if (file == entryAssembly)
+                {
+                    isAssemblyModified = InjectStartupHook(assembly, tracerAssembly);
+                }
+
+                var writeLineMethodReference = assembly.MainModule.ImportReference(writeLineMethod);
+
+                var importedMethods = new Dictionary<IMetadataTokenProvider, MethodReference>();
+                var importedTypes = new Dictionary<IMetadataTokenProvider, TypeReference>();
+
                 foreach (var type in assembly.Modules.SelectMany(m => m.Types))
                 {
                     foreach (var method in type.Methods)
@@ -60,199 +94,325 @@ namespace DatadogAssemblyPatcher
                             continue;
                         }
 
-                        bool changedInstruction;
+                        var integration = FindIntegration(method);
 
-                        do
+                        if (integration == null)
                         {
-                            changedInstruction = false;
+                            continue;
+                        }
 
-                            foreach (var instruction in method.Body.Instructions)
+                        Console.WriteLine($"Patching {integration.Value.TargetType}.{integration.Value.TargetMethod} in {integration.Value.TargetAssembly}");
+
+                        var ilProcessor = method.Body.GetILProcessor();
+
+                        if (!importedTypes.TryGetValue(callTargetStateType, out var callTargetStateReference))
+                        {
+                            callTargetStateReference = assembly.MainModule.ImportReference(callTargetStateType);
+                        }
+
+                        var stateVariable = new VariableDefinition(callTargetStateReference);
+                        ilProcessor.Body.Variables.Add(stateVariable);
+
+                        var callTargetBegin = callTargetInvokerType.Methods
+                            .First(m => m.Name == "BeginMethod"
+                                && m.GenericParameters.Count == 2 + method.Parameters.Count
+                                && m.Parameters.Count == m.GenericParameters.Count - 1
+                                && (method.Parameters.Count == 0 || m.Parameters[1].ParameterType.IsByReference));
+
+                        if (!importedMethods.TryGetValue(callTargetBegin, out var callTargetBeginReference))
+                        {
+                            callTargetBeginReference = assembly.MainModule.ImportReference(callTargetBegin);
+                        }
+
+                        var genericCallTargetBegin = new GenericInstanceMethod(callTargetBeginReference);
+
+                        var integrationType = tracerAssembly.MainModule.GetType(integration.Value.IntegrationType);
+
+                        var integrationTypeReference = assembly.MainModule.ImportReference(integrationType);
+
+                        genericCallTargetBegin.GenericArguments.Add(integrationTypeReference);
+                        genericCallTargetBegin.GenericArguments.Add(method.DeclaringType);
+
+                        foreach (var arg in method.Parameters)
+                        {
+                            genericCallTargetBegin.GenericArguments.Add(arg.ParameterType);
+                        }
+
+                        var start = ilProcessor.Body.Instructions[0];
+
+                        ilProcessor.InsertBefore(start, Instruction.Create(OpCodes.Ldarg_0));
+
+                        for (int i = 0; i < method.Parameters.Count; i++)
+                        {
+                            ilProcessor.InsertBefore(start, Instruction.Create(OpCodes.Ldarga, method.Parameters[i]));
+                        }
+
+                        ilProcessor.InsertBefore(start, Instruction.Create(OpCodes.Call, genericCallTargetBegin));
+                        ilProcessor.InsertBefore(start, Instruction.Create(OpCodes.Stloc, stateVariable));
+
+                        var ldstr = Instruction.Create(OpCodes.Ldstr, "Patched");
+
+                        ilProcessor.InsertBefore(ilProcessor.Body.Instructions[0], ldstr);
+                        ilProcessor.InsertAfter(ldstr, Instruction.Create(OpCodes.Call, writeLineMethodReference));
+
+                        var callTargetEnd = callTargetInvokerType.Methods
+                            .First(m => m.Name == "EndMethod"
+                                && m.Parameters.Count == (method.ReturnType == null ? 3 : 4)
+                                && m.Parameters.Last().ParameterType.IsByReference);
+
+                        if (!importedMethods.TryGetValue(callTargetEnd, out var callTargetEndReference))
+                        {
+                            callTargetEndReference = assembly.MainModule.ImportReference(callTargetEnd);
+                        }
+
+                        var genericCallTargetEnd = new GenericInstanceMethod(callTargetEndReference);
+                        genericCallTargetEnd.GenericArguments.Add(integrationTypeReference);
+                        genericCallTargetEnd.GenericArguments.Add(method.DeclaringType);
+
+                        if (method.ReturnType != null)
+                        {
+                            genericCallTargetEnd.GenericArguments.Add(method.ReturnType);
+                        }
+
+                        var returnVariable = new VariableDefinition(method.ReturnType);
+                        ilProcessor.Body.Variables.Add(returnVariable);
+
+                        var exit = Instruction.Create(OpCodes.Ldarg_0);
+
+                        ilProcessor.Append(exit);
+                        ilProcessor.Emit(OpCodes.Ldloc, returnVariable);
+                        ilProcessor.Emit(OpCodes.Ldnull);
+                        ilProcessor.Emit(OpCodes.Ldloca, stateVariable);
+
+                        ilProcessor.Emit(OpCodes.Call, genericCallTargetEnd);
+
+                        if (method.ReturnType == null)
+                        {
+                            ilProcessor.Emit(OpCodes.Pop);
+                        }
+                        else
+                        {
+                            if (!importedTypes.TryGetValue(callTargetReturnType, out var callTargetReturnTypeReference))
                             {
-                                if (instruction.OpCode == OpCodes.Calli || instruction.OpCode == OpCodes.Call)
-                                {
-                                    var methodReference = (MethodReference)instruction.Operand;
-
-                                    var replacement = FindReplacement(methodReference);
-
-                                    if (replacement == null)
-                                    {
-                                        continue;
-                                    }
-
-                                    Console.WriteLine($"Patching call from {method.FullName} to {replacement.Target.Assembly}.{replacement.Target.Method} with {replacement.Wrapper.Type}.{replacement.Wrapper.Method}");
-
-                                    var tempAssemblyFile = Path.GetTempFileName();
-
-                                    int mdToken;
-
-                                    try
-                                    {
-                                        assembly.Write(tempAssemblyFile);
-
-                                        using (var tempAssembly = AssemblyDefinition.ReadAssembly(file))
-                                        {
-                                            var reference = tempAssembly.Modules[0].MetadataResolver.Resolve(methodReference);
-                                            mdToken = reference.MetadataToken.ToInt32();
-                                        }
-                                    }
-                                    finally
-                                    {
-                                        File.Delete(tempAssemblyFile);
-                                    }
-
-                                    var replacementType = integrationsAssembly.MainModule.GetType(replacement.Wrapper.Type);
-
-                                    var replacementMethod = replacementType.Methods.First(m => m.Name == replacement.Wrapper.Method);
-
-                                    var referenceMethod = method.Module.ImportReference(replacementMethod);
-                                    var guid = method.Module.ImportReference(typeof(Guid));
-                                    var ilProcessor = method.Body.GetILProcessor();
-
-                                    if (methodReference.Parameters.Count > 0 && methodReference.Parameters.Last().ParameterType.Name == "CancellationToken")
-                                    {
-                                        ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Box, methodReference.Parameters.Last().ParameterType));
-                                    }
-
-                                    var mvid = methodReference.Module.Mvid;
-                                    var guidVariable = new VariableDefinition(guid);
-
-                                    method.Body.Variables.Add(guidVariable);
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4, instruction.OpCode.Value));
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4, mdToken));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldloca_S, guidVariable));
-
-                                    //var bytes = mvid.ToByteArray();
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                    (int)typeof(Guid).GetField("_a", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)typeof(Guid).GetField("_b", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)typeof(Guid).GetField("_c", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)(byte)typeof(Guid).GetField("_d", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)(byte)typeof(Guid).GetField("_e", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)(byte)typeof(Guid).GetField("_f", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4,
-                                        (short)(byte)typeof(Guid).GetField("_g", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4_S,
-                                        (sbyte)(byte)typeof(Guid).GetField("_h", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4_S,
-                                        (sbyte)(byte)typeof(Guid).GetField("_i", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4_S,
-                                        (sbyte)(byte)typeof(Guid).GetField("_j", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4_S,
-                                        (sbyte)(byte)typeof(Guid).GetField("_k", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(mvid)));
-
-
-                                    //for (int i = 0; i < 7; i++)
-                                    //{
-                                    //    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4, (int)bytes[i]));
-                                    //}
-
-                                    //for (int i = 0; i < 4; i++)
-                                    //{
-                                    //    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4_S, (sbyte)bytes[i + 7]));
-                                    //}
-
-
-                                    //ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldc_I4, 0));
-
-                                    var guidConstructor = guid.Resolve().GetConstructors().First(c => c.Parameters.Count == 11);
-
-                                    var guidConstructorRef = method.Module.ImportReference(guidConstructor);
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Call, guidConstructorRef));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Ldloca_S, guidVariable));
-
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Conv_U));
-                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Conv_U8));
-
-                                    ilProcessor.Replace(instruction, Instruction.Create(instruction.OpCode, referenceMethod));
-
-                                    isAssemblyModified = true;
-                                    changedInstruction = true;
-
-                                    break;
-                                }
+                                callTargetReturnTypeReference = assembly.MainModule.ImportReference(callTargetReturnType);
                             }
-                        } while (changedInstruction);
+
+                            var callTargetReturnTypeGeneric = new GenericInstanceType(callTargetReturnTypeReference);
+                            callTargetReturnTypeGeneric.GenericArguments.Add(method.ReturnType);
+
+                            if (!importedTypes.TryGetValue(callTargetReturnTypeGeneric, out var callTargetReturnTypeGenericReference))
+                            {
+                                callTargetReturnTypeGenericReference = assembly.MainModule.ImportReference(callTargetReturnTypeGeneric);
+                            }
+
+                            var callTargetReturnVariable = new VariableDefinition(callTargetReturnTypeGeneric);
+                            ilProcessor.Body.Variables.Add(callTargetReturnVariable);
+
+                            ilProcessor.Emit(OpCodes.Stloc, callTargetReturnVariable);
+                            ilProcessor.Emit(OpCodes.Ldloca, callTargetReturnVariable);
+
+                            var callTargetReturnMethod = callTargetReturnTypeGenericReference.Resolve().Methods.First(t => t.Name == "GetReturnValue");
+
+                            if (!importedMethods.TryGetValue(callTargetReturnMethod, out var callTargetReturnMethodReference))
+                            {
+                                callTargetReturnMethodReference = assembly.MainModule.ImportReference(callTargetReturnMethod);
+                            }
+
+                            ilProcessor.Emit(OpCodes.Call, callTargetReturnMethodReference);
+                        }
+
+                        var ret = Instruction.Create(OpCodes.Ret);
+                        ilProcessor.Append(ret);
+
+                        foreach (var instruction in method.Body.Instructions.ToList())
+                        {
+                            if (instruction.OpCode == OpCodes.Ret && instruction != ret)
+                            {
+                                if (method.ReturnType != null)
+                                {
+                                    ilProcessor.InsertBefore(instruction, Instruction.Create(OpCodes.Stloc, returnVariable));
+                                }
+
+                                ilProcessor.Replace(instruction, Instruction.Create(OpCodes.Br_S, exit));
+                            }
+                        }
+
+                        isAssemblyModified = true;
                     }
                 }
 
                 if (isAssemblyModified)
                 {
+                    Console.WriteLine($"Saving assembly {assembly.Name}");
                     assembly.Write(Path.Combine(outputFolder, Path.GetFileName(file)));
+                }
+            }
+
+            File.Copy(tracerPath, Path.Combine(outputFolder, "Datadog.Trace.dll"), overwrite: true);
+
+            Console.WriteLine("Patching deps.json file");
+
+            var depsJsonPath = Path.Combine(outputFolder, depsJson);
+
+            var json = JObject.Parse(File.ReadAllText(depsJsonPath));
+
+            var libraries = (JObject)json["libraries"];
+
+            libraries.Add("Datadog.Trace/2.1.0.0", JObject.FromObject(new
+            {
+                type = "reference",
+                serviceable = false,
+                sha512 = ""
+            }));
+
+            var targets = (JObject)json["targets"];
+
+            foreach (var targetProperty in targets.Properties())
+            {
+                var target = (JObject)targetProperty.Value;
+
+                target.Add("Datadog.Trace/2.1.0.0", new JObject(new JProperty("runtime", new JObject(
+                        new JProperty("Datadog.Trace.dll", new JObject(
+                            new JProperty("assemblyVersion", "2.1.0.0"),
+                            new JProperty("fileVersion", "2.1.0.0")))))));
+            }
+
+            using (var stream = File.CreateText(depsJsonPath))
+            {
+                using (var writer = new JsonTextWriter(stream) { Formatting = Formatting.Indented })
+                {
+                    json.WriteTo(writer);
                 }
             }
 
             Console.WriteLine("Done");
         }
 
-        private static MethodReplacement FindReplacement(MethodReference candidate)
+        private static bool InjectStartupHook(AssemblyDefinition assembly, AssemblyDefinition tracerAssembly)
         {
+            if (assembly.EntryPoint == null)
+            {
+                Console.WriteLine($"Could not locate entry point of assembly {assembly.Name}");
+                return false;
+            }
+
+            var initializeMethod = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.Instrumentation")
+                .Methods.First(t => t.Name == "Initialize");
+
+            var initializeMethodReference = assembly.MainModule.ImportReference(initializeMethod);
+
+            var ilProcessor = assembly.EntryPoint.Body.GetILProcessor();
+
+
+
+
+            ilProcessor.InsertBefore(ilProcessor.Body.Instructions[0], Instruction.Create(OpCodes.Call, initializeMethodReference));
+
+            return true;
+        }
+
+        private static NativeCallTargetDefinition[] ReadIntegrations(string path)
+        {
+            var assembly = Assembly.LoadFrom(path);
+
+            var instrumentationDefinitions = assembly.GetType("Datadog.Trace.ClrProfiler.InstrumentationDefinitions");
+            var method = instrumentationDefinitions.GetMethod("GetDefinitionsArray", BindingFlags.NonPublic | BindingFlags.Static);
+
+            var array = (Array)method.Invoke(null, null);
+
+            var elementType = array.GetType().GetElementType();
+            var disposeMethod = elementType.GetMethod("Dispose");
+
+            var definitionType = typeof(NativeCallTargetDefinition);
+
+            var result = new NativeCallTargetDefinition[array.Length];
+
+            IntPtr signaturesPtr = default;
+
+            for (int i = 0; i < array.Length; i++)
+            {
+                var boxedDefinition = (object)default(NativeCallTargetDefinition);
+
+                var obj = array.GetValue(i);
+
+                foreach (var field in elementType.GetFields())
+                {
+                    if (field.Name == "TargetSignatureTypes")
+                    {
+                        signaturesPtr = (IntPtr)field.GetValue(obj);
+                        continue;
+                    }
+
+                    definitionType.GetField(field.Name).SetValue(boxedDefinition, field.GetValue(obj));
+                }
+
+                var length = ((NativeCallTargetDefinition)boxedDefinition).TargetSignatureTypesLength;
+
+                var targetSignatureTypes = new string[length];
+
+                for (int j = 0; j < length; j++)
+                {
+                    var ptr = Marshal.ReadIntPtr(signaturesPtr + Marshal.SizeOf<IntPtr>() * j);
+                    targetSignatureTypes[j] = Marshal.PtrToStringUni(ptr);
+                }
+
+                disposeMethod.Invoke(obj, null);
+
+                result[i] = (NativeCallTargetDefinition)boxedDefinition;
+                result[i].TargetSignatureTypes = targetSignatureTypes;
+            }
+
+            return result;
+        }
+
+        private static NativeCallTargetDefinition? FindIntegration(MethodDefinition method)
+        {
+            var assembly = method.Module.Assembly;
+
             foreach (var integration in _integrations)
             {
-                foreach (var replacement in integration.MethodReplacements)
+                if (integration.TargetAssembly != assembly.Name.Name)
                 {
-                    var target = replacement.Target;
-
-                    if (target.Type != candidate.DeclaringType.FullName)
-                    {
-                        continue;
-                    }
-
-                    // Look for method
-                    if (candidate.Name != target.Method)
-                    {
-                        continue;
-                    }
-
-                    int expectedParameterCount = target.SignatureTypes.Length - 1;
-
-                    if (candidate.Parameters.Count != expectedParameterCount)
-                    {
-                        continue;
-                    }
-
-                    bool parameterMismatch = false;
-
-                    for (int i = 0; i < candidate.Parameters.Count; i++)
-                    {
-                        if (candidate.Parameters[i].ParameterType.FullName != target.SignatureTypes[i + 1])
-                        {
-                            parameterMismatch = true;
-                            break;
-                        }
-                    }
-
-                    if (parameterMismatch)
-                    {
-                        continue;
-                    }
-
-                    if (candidate.ReturnType.FullName != target.SignatureTypes[0])
-                    {
-                        continue;
-                    }
-
-                    return replacement;
+                    continue;
                 }
+
+                if (integration.TargetMaximumMajor < assembly.Name.Version.Major
+                    || integration.TargetMaximumMinor < assembly.Name.Version.Minor
+                    || integration.TargetMaximumPatch < assembly.Name.Version.Revision)
+                {
+                    continue;
+                }
+
+                if (integration.TargetMinimumMajor > assembly.Name.Version.Major
+                    || integration.TargetMinimumMinor < assembly.Name.Version.Minor
+                    || integration.TargetMinimumPatch < assembly.Name.Version.Revision)
+                {
+                    continue;
+                }
+
+                if (integration.TargetMethod != method.Name)
+                {
+                    continue;
+                }
+
+                if (integration.TargetType != method.DeclaringType.FullName)
+                {
+                    continue;
+                }
+
+                var parametersCount = method.Parameters.Count;
+
+                if (method.ReturnType != null)
+                {
+                    parametersCount++;
+                }
+
+                if (integration.TargetSignatureTypesLength != parametersCount)
+                {
+                    continue;
+                }
+
+                return integration;
             }
 
             return null;
