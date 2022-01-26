@@ -32,10 +32,6 @@ namespace DatadogAssemblyPatcher
 
             _integrations = ReadIntegrations(tracerPath);
 
-            var resolver = new DefaultAssemblyResolver();
-            resolver.AddSearchDirectory(inputFolder);
-            resolver.AddSearchDirectory(Path.Combine(tracerHomeFolder, "netcoreapp3.1"));
-
             var tracerAssembly = AssemblyDefinition.ReadAssembly(tracerPath);
 
             var consoleAssembly = AssemblyDefinition.ReadAssembly(Path.Combine(inputFolder, "System.Console.dll"));
@@ -49,7 +45,7 @@ namespace DatadogAssemblyPatcher
             var callTargetStateType = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.CallTarget.CallTargetState");
 
             var callTargetReturnType = tracerAssembly.MainModule.Types.First(t => t.FullName == "Datadog.Trace.ClrProfiler.CallTarget.CallTargetReturn`1");
-            //var callTargetReturnMethod = callTargetReturnType.Methods.First(t => t.Name == "GetReturnValue");
+            var callTargetReturnMethod = callTargetReturnType.Methods.First(t => t.Name == "GetReturnValue");
 
             var depsJson = Path.GetFileNameWithoutExtension(entryAssembly) + ".deps.json";
 
@@ -61,7 +57,7 @@ namespace DatadogAssemblyPatcher
 
                 try
                 {
-                    assembly = AssemblyDefinition.ReadAssembly(file, new ReaderParameters { AssemblyResolver = resolver });
+                    assembly = AssemblyDefinition.ReadAssembly(file);
                 }
                 catch (Exception)
                 {
@@ -200,23 +196,14 @@ namespace DatadogAssemblyPatcher
                             var callTargetReturnTypeGeneric = new GenericInstanceType(callTargetReturnTypeReference);
                             callTargetReturnTypeGeneric.GenericArguments.Add(method.ReturnType);
 
-                            if (!importedTypes.TryGetValue(callTargetReturnTypeGeneric, out var callTargetReturnTypeGenericReference))
-                            {
-                                callTargetReturnTypeGenericReference = assembly.MainModule.ImportReference(callTargetReturnTypeGeneric);
-                            }
-
                             var callTargetReturnVariable = new VariableDefinition(callTargetReturnTypeGeneric);
                             ilProcessor.Body.Variables.Add(callTargetReturnVariable);
 
                             ilProcessor.Emit(OpCodes.Stloc, callTargetReturnVariable);
                             ilProcessor.Emit(OpCodes.Ldloca, callTargetReturnVariable);
 
-                            var callTargetReturnMethod = callTargetReturnTypeGenericReference.Resolve().Methods.First(t => t.Name == "GetReturnValue");
-
-                            if (!importedMethods.TryGetValue(callTargetReturnMethod, out var callTargetReturnMethodReference))
-                            {
-                                callTargetReturnMethodReference = assembly.MainModule.ImportReference(callTargetReturnMethod);
-                            }
+                            var callTargetReturnMethodReference = assembly.MainModule.ImportReference(callTargetReturnMethod);
+                            callTargetReturnMethodReference.DeclaringType = callTargetReturnTypeGeneric;
 
                             ilProcessor.Emit(OpCodes.Call, callTargetReturnMethodReference);
                         }
